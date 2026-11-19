@@ -98,27 +98,60 @@ export class Amordegrc extends BaseFunction {
         periodValue: number,
         rateValue: number,
         basisValue: number
-    ): NumberValueObject {
-        const depreciationRate = rateValue * this._getCoefficient(1 / rateValue);
+    ): BaseValueObject {
+        const life = 1 / rateValue;
+
+        // Excel returns #NUM! for an asset whose life (1 / rate) is two years or less.
+        if (life <= 2) {
+            return ErrorValueObject.create(ErrorType.NUM);
+        }
+
+        const coefficient = this._getCoefficient(life);
+        // Periods are numbered from 0, so the last one of the asset's life is this one.
+        const lastPeriod = Math.ceil(life) - 1;
         const { days, yearDays } = getTwoDateDaysByBasis(datePurchasedSerialNumber, firstPeriodSerialNumber, basisValue, this.getDateSystem());
 
-        // Period 0 runs from the purchase to the end of the first period, so it is prorated.
-        // Every depreciation is rounded to a whole number.
-        let depreciation = this._round((days / yearDays) * depreciationRate * costValue);
-        let bookValue = costValue - depreciation;
-        let depreciable = bookValue - salvageValue;
+        let bookValue = costValue;
+        // What is left to depreciate before the asset reaches its salvage value.
+        let remaining = costValue - salvageValue;
+        let depreciation = 0;
 
-        for (let currentPeriod = 0; currentPeriod < periodValue; currentPeriod++) {
-            depreciation = this._round(depreciationRate * bookValue);
-            depreciable -= depreciation;
+        for (let currentPeriod = 0; currentPeriod <= periodValue; currentPeriod++) {
+            if (remaining <= 0 || currentPeriod > lastPeriod) {
+                return NumberValueObject.create(0);
+            }
 
-            if (depreciable < 0) {
-                // The period that would pass the salvage value takes half of the book value,
-                // and the ones after it take nothing.
-                return NumberValueObject.create(periodValue - currentPeriod <= 1 ? this._round(bookValue * 0.5) : 0);
+            if (currentPeriod === lastPeriod) {
+                // The last period takes what is left above the salvage value.
+                depreciation = this._round(remaining);
+            } else if (currentPeriod === lastPeriod - 1) {
+                // The period before it takes half of the book value.
+                depreciation = this._round(bookValue * 0.5);
+            } else {
+                // Period 0 runs from the purchase to the end of the first period and is prorated;
+                // a purchase on the first period date counts as a whole period.
+                depreciation = currentPeriod === 0
+                    ? this._round(days === 0 ? costValue * rateValue * coefficient : costValue * rateValue * coefficient * days / yearDays)
+                    : this._round(bookValue * rateValue * coefficient);
+
+                if (depreciation > remaining) {
+                    depreciation = this._round(remaining);
+                }
+
+                // A depreciation that rounds to 0 leaves the book value unchanged, so every period
+                // until the last two is 0 as well.
+                if (depreciation === 0) {
+                    if (periodValue < lastPeriod - 1) {
+                        return NumberValueObject.create(0);
+                    }
+
+                    currentPeriod = lastPeriod - 2;
+                    continue;
+                }
             }
 
             bookValue -= depreciation;
+            remaining -= depreciation;
         }
 
         return NumberValueObject.create(depreciation);
@@ -132,14 +165,11 @@ export class Amordegrc extends BaseFunction {
     }
 
     /**
-     * The depreciation coefficient of the French accounting system, by the life of the asset in years (1 / rate).
+     * The depreciation coefficient of the French accounting system, by the life of the asset in
+     * years (1 / rate), with the bands Excel uses: (2, 4] is 1.5, (4, 6] is 2 and longer is 2.5.
      */
     private _getCoefficient(life: number): number {
-        if (life < 3) {
-            return 1;
-        }
-
-        if (life < 5) {
+        if (life <= 4) {
             return 1.5;
         }
 
